@@ -3,6 +3,12 @@ Changelog
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- `aws_dynamodb_partiql`: add `use_execute_statement` field to support executing PartiQL statements individually via `ExecuteStatement`, enabling queries against Global Secondary Indexes (GSIs).
+
 ## 4.80.1 - 2026-02-05
 
 ### Changed
