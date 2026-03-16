@@ -16,6 +16,7 @@ package aws
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -31,10 +32,15 @@ import (
 type mockProcDynamoDB struct {
 	dynamoDBAPI
 	pbatchFn func(context.Context, *dynamodb.BatchExecuteStatementInput) (*dynamodb.BatchExecuteStatementOutput, error)
+	pexecFn  func(context.Context, *dynamodb.ExecuteStatementInput) (*dynamodb.ExecuteStatementOutput, error)
 }
 
 func (m *mockProcDynamoDB) BatchExecuteStatement(ctx context.Context, params *dynamodb.BatchExecuteStatementInput, _ ...func(*dynamodb.Options)) (*dynamodb.BatchExecuteStatementOutput, error) {
 	return m.pbatchFn(ctx, params)
+}
+
+func (m *mockProcDynamoDB) ExecuteStatement(ctx context.Context, params *dynamodb.ExecuteStatementInput, _ ...func(*dynamodb.Options)) (*dynamodb.ExecuteStatementOutput, error) {
+	return m.pexecFn(ctx, params)
 }
 
 func assertBatchMatches(t *testing.T, exp service.MessageBatch, act []service.MessageBatch) {
@@ -66,7 +72,7 @@ root."-".S = json("content")
 		},
 	}
 
-	db := newDynamoDBPartiQL(nil, client, query, nil, mapping)
+	db := newDynamoDBPartiQL(nil, client, query, nil, mapping, false)
 
 	reqBatch := service.MessageBatch{
 		service.NewMessage([]byte(`{"content":"foo stuff","id":"foo"}`)),
@@ -128,7 +134,7 @@ root."-".S = json("id")
 		},
 	}
 
-	db := newDynamoDBPartiQL(nil, client, query, nil, mapping)
+	db := newDynamoDBPartiQL(nil, client, query, nil, mapping, false)
 
 	reqBatch := service.MessageBatch{
 		service.NewMessage([]byte(`{"id":"foo","content":"foo stuff"}`)),
@@ -204,7 +210,7 @@ root."-".S = json("content")
 		},
 	}
 
-	db := newDynamoDBPartiQL(nil, client, query, nil, mapping)
+	db := newDynamoDBPartiQL(nil, client, query, nil, mapping, false)
 
 	reqBatch := service.MessageBatch{
 		service.NewMessage([]byte(`{"content":"foo stuff","id":"foo"}`)),
@@ -253,4 +259,91 @@ root."-".S = json("content")
 	}
 
 	assert.Equal(t, expected, requests)
+}
+
+func TestDynamoDBPartiqlExecuteStatementRead(t *testing.T) {
+	query := `SELECT * FROM Orders.OrdersByCustomer WHERE CustomerID = ?`
+	mapping, err := bloblang.Parse(`
+root = []
+root."-".S = json("id")
+`)
+	require.NoError(t, err)
+
+	var requests []*dynamodb.ExecuteStatementInput
+	client := &mockProcDynamoDB{
+		pexecFn: func(_ context.Context, input *dynamodb.ExecuteStatementInput) (*dynamodb.ExecuteStatementOutput, error) {
+			cp := *input
+			requests = append(requests, &cp)
+			return &dynamodb.ExecuteStatementOutput{
+				Items: []map[string]types.AttributeValue{
+					{"meow": &types.AttributeValueMemberS{Value: "meow1"}},
+					{"meow": &types.AttributeValueMemberS{Value: "meow2"}},
+				},
+			}, nil
+		},
+	}
+
+	db := newDynamoDBPartiQL(nil, client, query, nil, mapping, true)
+
+	reqBatch := service.MessageBatch{
+		service.NewMessage([]byte(`{"id":"cust1"}`)),
+		service.NewMessage([]byte(`{"id":"cust2"}`)),
+	}
+
+	resBatch, err := db.ProcessBatch(t.Context(), reqBatch)
+	require.NoError(t, err)
+	require.Len(t, resBatch, 1)
+	require.Len(t, resBatch[0], 2)
+
+	structured, err := resBatch[0][0].AsStructured()
+	require.NoError(t, err)
+	items, ok := structured.([]any)
+	require.True(t, ok, "expected result to be array")
+	assert.Len(t, items, 2)
+
+	assert.Len(t, requests, 2)
+	assert.Equal(t, query, *requests[0].Statement)
+	assert.Equal(t, query, *requests[1].Statement)
+}
+
+func TestDynamoDBPartiqlExecuteStatementError(t *testing.T) {
+	t.Parallel()
+
+	query := `SELECT * FROM Orders.OrdersByCustomer WHERE CustomerID = ?`
+	mapping, err := bloblang.Parse(`
+root = []
+root."-".S = json("id")
+`)
+	require.NoError(t, err)
+
+	callCount := 0
+	client := &mockProcDynamoDB{
+		pexecFn: func(_ context.Context, _ *dynamodb.ExecuteStatementInput) (*dynamodb.ExecuteStatementOutput, error) {
+			callCount++
+			if callCount == 2 {
+				return nil, fmt.Errorf("simulated error")
+			}
+			return &dynamodb.ExecuteStatementOutput{
+				Items: []map[string]types.AttributeValue{
+					{"id": &types.AttributeValueMemberS{Value: "found"}},
+				},
+			}, nil
+		},
+	}
+
+	db := newDynamoDBPartiQL(nil, client, query, nil, mapping, true)
+
+	reqBatch := service.MessageBatch{
+		service.NewMessage([]byte(`{"id":"cust1"}`)),
+		service.NewMessage([]byte(`{"id":"cust2"}`)),
+	}
+
+	resBatch, err := db.ProcessBatch(t.Context(), reqBatch)
+	require.NoError(t, err)
+	require.Len(t, resBatch, 1)
+
+	require.NoError(t, resBatch[0][0].GetError())
+
+	require.Error(t, resBatch[0][1].GetError())
+	assert.Contains(t, resBatch[0][1].GetError().Error(), "simulated error")
 }

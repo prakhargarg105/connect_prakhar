@@ -36,6 +36,9 @@ func init() {
 		Version("3.48.0").
 		Field(service.NewStringField("query").Description("A PartiQL query to execute for each message.")).
 		Field(service.NewBoolField("unsafe_dynamic_query").Description("Whether to enable dynamic queries that support interpolation functions.").Advanced().Default(false)).
+		Field(service.NewBoolField("use_execute_statement").
+			Description("When true, executes each statement individually using ExecuteStatement instead of BatchExecuteStatement. Required for queries targeting Global Secondary Indexes (GSIs).").
+			Default(false)).
 		Field(service.NewBloblangField("args_mapping").
 			Description("A xref:guides:bloblang/about.adoc[Bloblang mapping] that, for each message, creates a list of arguments to use with the query.").Default("")).
 		Example(
@@ -86,7 +89,11 @@ pipeline:
 					return nil, fmt.Errorf("failed to parse query: %v", err)
 				}
 			}
-			return newDynamoDBPartiQL(mgr.Logger(), client, query, dynQuery, args), nil
+			useExecStmt, err := conf.FieldBool("use_execute_statement")
+			if err != nil {
+				return nil, err
+			}
+			return newDynamoDBPartiQL(mgr.Logger(), client, query, dynQuery, args, useExecStmt), nil
 		})
 }
 
@@ -94,9 +101,10 @@ type dynamoDBPartiQL struct {
 	logger *service.Logger
 	client dynamoDBAPI
 
-	query    string
-	dynQuery *service.InterpolatedString
-	args     *bloblang.Executor
+	query               string
+	dynQuery            *service.InterpolatedString
+	args                *bloblang.Executor
+	useExecuteStatement bool
 }
 
 func newDynamoDBPartiQL(
@@ -105,18 +113,81 @@ func newDynamoDBPartiQL(
 	query string,
 	dynQuery *service.InterpolatedString,
 	args *bloblang.Executor,
+	useExecuteStatement bool,
 ) *dynamoDBPartiQL {
 	return &dynamoDBPartiQL{
-		logger:   logger,
-		client:   client,
-		query:    query,
-		dynQuery: dynQuery,
-		args:     args,
+		logger:              logger,
+		client:              client,
+		query:               query,
+		dynQuery:            dynQuery,
+		args:                args,
+		useExecuteStatement: useExecuteStatement,
 	}
+}
+
+func (d *dynamoDBPartiQL) processWithExecuteStatement(ctx context.Context, batch service.MessageBatch, argsExec *service.MessageBatchBloblangExecutor) ([]service.MessageBatch, error) {
+	for i := range batch {
+		stmt := d.query
+		if d.dynQuery != nil {
+			var err error
+			stmt, err = batch.TryInterpolatedString(i, d.dynQuery)
+			if err != nil {
+				return nil, fmt.Errorf("query interpolation error: %w", err)
+			}
+		}
+
+		argMsg, err := argsExec.Query(i)
+		if err != nil {
+			return nil, fmt.Errorf("error evaluating arg mapping at index %d: %v", i, err)
+		}
+		argStructured, err := argMsg.AsStructured()
+		if err != nil {
+			return nil, fmt.Errorf("error evaluating arg mapping as structured at index %d: %v", i, err)
+		}
+		argsSlice, ok := argStructured.([]any)
+		if !ok {
+			return nil, fmt.Errorf("arg mapping resulted in non-array value at index %d: %T", i, argStructured)
+		}
+
+		var params []types.AttributeValue
+		for j, a := range argsSlice {
+			tmp, err := objFormToAttributeValue(a)
+			if err != nil {
+				return nil, fmt.Errorf("arg mapping index %d failed to map to an attribute value: %v", j, err)
+			}
+			params = append(params, tmp)
+		}
+
+		res, err := d.client.ExecuteStatement(ctx, &dynamodb.ExecuteStatementInput{
+			Statement:  &stmt,
+			Parameters: params,
+		})
+		if err != nil {
+			batch[i].SetError(fmt.Errorf("failed to execute statement: %w", err))
+			continue
+		}
+
+		if len(res.Items) > 0 {
+			itemsSlice := make([]any, len(res.Items))
+			for j, item := range res.Items {
+				resMap := map[string]any{}
+				for k, v := range item {
+					resMap[k] = attributeValueToObjForm(v)
+				}
+				itemsSlice[j] = resMap
+			}
+			batch[i].SetStructuredMut(itemsSlice)
+		}
+	}
+	return []service.MessageBatch{batch}, nil
 }
 
 func (d *dynamoDBPartiQL) ProcessBatch(ctx context.Context, batch service.MessageBatch) ([]service.MessageBatch, error) {
 	argsExec := batch.BloblangExecutor(d.args)
+
+	if d.useExecuteStatement {
+		return d.processWithExecuteStatement(ctx, batch, argsExec)
+	}
 
 	stmts := []types.BatchStatementRequest{}
 	for i := range batch {
