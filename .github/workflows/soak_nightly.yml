@@ -1,0 +1,89 @@
+name: Nightly Soak
+
+# DEMO SHIM (fork-main copy). GitHub only registers workflow_dispatch for
+# files on the default branch, so this thin variant lives on main and runs
+# the soak from the con-179-r6-soak branch. It deliberately has NO cron:
+# the real schedule arms when the full workflow
+# (.github/workflows/soak_nightly.yml on con-179-r6-soak) merges, replacing
+# this file. Setup + design notes live in the branch copy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch containing the bench framework'
+        required: false
+        default: 'con-179-r6-soak'
+        type: string
+      scenario:
+        description: 'Soak scenario (path under benchmarking/aws/scenarios, no .yaml)'
+        required: false
+        default: 'postgres/orders-soak'
+        type: string
+
+concurrency:
+  group: bench-soak
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 220
+    env:
+      REDPANDA_LICENSE_SECRET: redpanda-connect-bench/license
+    steps:
+      - name: Checkout bench branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || 'con-179-r6-soak' }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::605419575229:role/rpcn-bench-gha-provisioner
+          aws-region: us-east-2
+          role-duration-seconds: 14400
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Install Task
+        uses: ./.github/actions/setup-task
+
+      - name: Run soak
+        working-directory: benchmarking/aws
+        run: |
+          task aws:bench scenario="${{ github.event.inputs.scenario || 'postgres/orders-soak' }}" 2>&1 | tee "$RUNNER_TEMP/soak-run.log"
+
+      - name: Verify teardown actually completed
+        if: always()
+        run: |
+          LIVE=$(aws ec2 describe-instances --region us-east-2 \
+            --filters Name=tag:Project,Values=redpanda-connect-bench Name=instance-state-name,Values=pending,running,stopping,stopped \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          RDS=$(aws rds describe-db-instances --region us-east-2 \
+            --query "DBInstances[].DBInstanceIdentifier" --output text)
+          if [ -n "$LIVE$RDS" ]; then
+            echo "::error::Teardown left resources behind (EC2: ${LIVE:-none}; RDS: ${RDS:-none}). The orphan reaper will sweep them within its TTL, but investigate the run log."
+            exit 1
+          fi
+          echo "account clean: no bench EC2, no RDS"
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: soak-run-log
+          path: ${{ runner.temp }}/soak-run.log
+          retention-days: 30
