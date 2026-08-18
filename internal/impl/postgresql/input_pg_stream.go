@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jeffail/checkpoint"
@@ -716,9 +717,29 @@ func (p *pgStreamInput) flushBatch(
 	return nil
 }
 
+// DEMO LEAK (CON-179 R6 increment 6) — DO NOT MERGE.
+//
+// Deliberately planted regression for proving the soak pipeline detects
+// slow leaks: roughly 1 in 150 message payloads is copied into a
+// package-level slice that nothing ever frees. At the soak's 10K msg/s x
+// 1200 B that retains ~4.8 MB/min — above the 2 MB/min rss-slope alarm
+// threshold, past the 130% RSS comparison verdict within a 30-minute /soak
+// arm, and far below GOMEMLIMIT so the demo cannot OOM mid-run.
+var (
+	demoLeakRetained [][]byte
+	demoLeakCounter  atomic.Int64
+)
+
 func (p *pgStreamInput) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	select {
 	case m := <-p.msgChan:
+		for _, msg := range m.msg {
+			if demoLeakCounter.Add(1)%150 == 0 {
+				if b, err := msg.AsBytes(); err == nil {
+					demoLeakRetained = append(demoLeakRetained, append([]byte(nil), b...))
+				}
+			}
+		}
 		return m.msg, m.ackFn, nil
 	case <-p.stopSig.HasStoppedChan():
 		return nil, nil, service.ErrNotConnected
