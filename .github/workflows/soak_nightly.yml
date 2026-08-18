@@ -63,6 +63,9 @@ jobs:
 
       - name: Run soak
         working-directory: benchmarking/aws
+        # Explicit shell enables pipefail; the default run shell is bash -e
+        # WITHOUT it, so `| tee` masked a failed soak as green (2026-08-17).
+        shell: bash
         run: |
           task aws:bench scenario="${{ github.event.inputs.scenario || 'postgres/orders-soak' }}" 2>&1 | tee "$RUNNER_TEMP/soak-run.log"
 
