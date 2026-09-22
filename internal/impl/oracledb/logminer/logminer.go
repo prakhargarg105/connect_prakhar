@@ -53,6 +53,9 @@ type LogMiner struct {
 	logMinerQuery string
 	txnCache      TransactionCache
 
+	contentStmt    *sql.Stmt
+	currentSCNStmt *sql.Stmt
+
 	// Redo logs don't include data types so we have to find lob types up front.
 	// ie "TESTDB.PRODUCTS.DESCRIPTION": "NCLOB",
 	lobColTypes map[string]string
@@ -100,7 +103,7 @@ func NewMiner(db *sql.DB, userTables []replication.UserTable, publisher replicat
 		fmt.Fprintf(&buf, " AND SRC_CON_NAME = '%s'", strings.ReplaceAll(cfg.PDBName, "'", "''"))
 	}
 
-	logMinerQuery := "SELECT SCN, SQL_REDO, OPERATION_CODE, TABLE_NAME, SEG_OWNER, TIMESTAMP, XID, COMMIT_SCN, CSF FROM V$LOGMNR_CONTENTS WHERE SCN > :1 AND SCN <= :2" + buf.String()
+	logMinerQuery := "SELECT SCN, SQL_REDO, OPERATION_CODE, TABLE_NAME, SEG_OWNER, TIMESTAMP, XID, COMMIT_SCN, CSF, USERNAME FROM V$LOGMNR_CONTENTS WHERE SCN > :1 AND SCN <= :2" + buf.String()
 
 	lm := &LogMiner{
 		cfg:                  cfg,
@@ -140,6 +143,12 @@ func (lm *LogMiner) ReadChanges(ctx context.Context, startPos replication.SCN) (
 	defer func() {
 		if err := conn.Close(); err != nil && resErr == nil {
 			resErr = fmt.Errorf("closing connection: %w", err)
+		}
+	}()
+
+	defer func() {
+		if err := lm.Close(); err != nil {
+			lm.log.Errorf("closing prepared logminer statements: %v", err)
 		}
 	}()
 
@@ -185,6 +194,38 @@ func (lm *LogMiner) ReadChanges(ctx context.Context, startPos replication.SCN) (
 	}
 }
 
+// Close releases all statements prepared over the lifetime of a ReadChanges
+// call, along with those owned by the session manager and log file
+// collector. It must only be called once the dedicated connection those
+// statements were prepared on is no longer needed for LogMiner operations.
+func (lm *LogMiner) Close() error {
+	var errs []error
+
+	if lm.contentStmt != nil {
+		if err := lm.contentStmt.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing logminer contents statement: %w", err))
+		}
+		lm.contentStmt = nil
+	}
+
+	if lm.currentSCNStmt != nil {
+		if err := lm.currentSCNStmt.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing current SCN statement: %w", err))
+		}
+		lm.currentSCNStmt = nil
+	}
+
+	if err := lm.logCollector.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("closing log file collector statements: %w", err))
+	}
+
+	if err := lm.sessionMgr.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("closing session manager statements: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
 // FindStartPos returns the database's current SCN so that streaming begins from
 // the present moment rather than replaying historical redo logs.
 func (lm *LogMiner) FindStartPos(ctx context.Context) (replication.SCN, error) {
@@ -211,8 +252,15 @@ func (lm *LogMiner) endExpiredIdleSession(ctx context.Context, conn *sql.Conn) {
 
 func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp bool, err error) {
 	// Get database's current SCN to know our target
+	if lm.currentSCNStmt == nil {
+		stmt, err := conn.PrepareContext(ctx, "SELECT CURRENT_SCN FROM V$DATABASE")
+		if err != nil {
+			return false, fmt.Errorf("preparing current SCN query: %w", err)
+		}
+		lm.currentSCNStmt = stmt
+	}
 	var dbCurrentSCN uint64
-	if err := conn.QueryRowContext(ctx, "SELECT CURRENT_SCN FROM V$DATABASE").Scan(&dbCurrentSCN); err != nil {
+	if err := lm.currentSCNStmt.QueryRowContext(ctx).Scan(&dbCurrentSCN); err != nil {
 		return false, fmt.Errorf("fetching current SCN: %w", err)
 	}
 
@@ -244,6 +292,10 @@ func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp b
 			return false, fmt.Errorf("preparing logs and starting session at position %d: %w\n\n"+
 				"This error indicates archived redo logs have been purged before LogMiner could process them.\n"+
 				"This typically happens when processing takes longer than Oracle's log retention period.\n\n"+
+				"This can also happen after a flashback and OPEN RESETLOGS on the source database: if this\n"+
+				"connector's last checkpoint predates the new incarnation's RESETLOGS_CHANGE#, no log file —\n"+
+				"old or new incarnation — covers that gap. This is not a retention issue, and increasing\n"+
+				"retention (below) will not help; only option 3 applies in that case.\n\n"+
 				"To fix this issue:\n"+
 				"1. Increase Oracle's archived log retention using RMAN:\n"+
 				"   CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 7 DAYS;\n\n"+
@@ -253,7 +305,13 @@ func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp b
 				"   - Increase input batching.count for better throughput\n"+
 				"   - Use faster output (e.g., drop: {} for benchmarking)\n\n"+
 				"3. Restart the connector from the current database SCN to skip missing logs:\n"+
-				"   Note: This will result in data loss for events in the purged logs, so a snapshot may be required.",
+				"   - Delete the checkpoint cache entry at checkpoint_cache_key and restart. A flashback rolls\n"+
+				"     this row back rather than clearing it (with the default Oracle-based cache), so it will\n"+
+				"     still be present and must be deleted explicitly, or the connector resumes from the same\n"+
+				"     stale SCN and hits this error again.\n"+
+				"   - This loses events between the last checkpoint and the restart. To avoid that, delete the\n"+
+				"     checkpoint and set snapshot_mode to snapshot_and_stream at the same time — snapshot_mode\n"+
+				"     alone has no effect, since a checkpoint that is still present skips snapshotting entirely.",
 				lm.currentSCN, err, lm.cfg.SCNWindowSize, lm.cfg.MiningBackoffInterval)
 		}
 		if errors.As(err, &oraErr) && oraErr.ErrCode == errCodeRedoLogHeaderMismatch {
@@ -505,6 +563,7 @@ func (lm *LogMiner) processRedoEvent(ctx context.Context, redoEvent *sqlredo.Red
 							OldValues:     acc.PKValues,
 							TransactionID: redoEvent.TransactionID,
 							Timestamp:     redoEvent.Timestamp,
+							Username:      redoEvent.Username.String,
 						}
 						txn.Events = append(txn.Events, synthetic)
 						lm.log.Debugf("LOB merge: synthesized UPDATE for %s.%s.%s (pks=%v, fragments=%d)", acc.Schema, acc.Table, acc.Column, acc.PKValues, len(acc.Fragments))
@@ -914,8 +973,15 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 
 	// Use the pre-built query from initialization
 	lm.log.Debugf("Executing LogMiner query with SCN range (scn=%d to %d with window %d)", startSCN, endSCN, lm.windowSize)
+	if lm.contentStmt == nil {
+		stmt, err := conn.PrepareContext(ctx, lm.logMinerQuery)
+		if err != nil {
+			return fmt.Errorf("preparing logminer contents query: %w", err)
+		}
+		lm.contentStmt = stmt
+	}
 	queryStart := time.Now()
-	rows, err := conn.QueryContext(ctx, lm.logMinerQuery, startSCN, endSCN)
+	rows, err := lm.contentStmt.QueryContext(ctx, startSCN, endSCN)
 	if err != nil {
 		return fmt.Errorf("querying logminer: %w", err)
 	}
@@ -948,6 +1014,7 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 			&event.TransactionID,
 			&commitSCN,
 			&csf,
+			&event.Username,
 		); err != nil {
 			return err
 		}
@@ -1016,7 +1083,9 @@ type LogFile struct {
 }
 
 // LogFileCollector finds relevant log files to mine
-type LogFileCollector struct{}
+type LogFileCollector struct {
+	stmt *sql.Stmt
+}
 
 // NewLogFileCollector creates a new *LogFileCollector which is responsible for
 // discovering the relevant log files to mine.
@@ -1025,7 +1094,7 @@ func NewLogFileCollector() *LogFileCollector {
 }
 
 // GetLogsBySCNRange collects log files whose SCN range overlaps [startSCN, endSCN].
-func (*LogFileCollector) GetLogsBySCNRange(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64) ([]*LogFile, error) {
+func (c *LogFileCollector) GetLogsBySCNRange(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64) ([]*LogFile, error) {
 	query := `
 		SELECT FILE_NAME, FIRST_CHANGE, NEXT_CHANGE, SEQ, TYPE, THREAD
 		FROM (
@@ -1054,12 +1123,14 @@ func (*LogFileCollector) GetLogsBySCNRange(ctx context.Context, conn *sql.Conn, 
 				A.SEQUENCE# AS SEQ,
 				'ARCHIVED' AS TYPE,
 				A.THREAD# AS THREAD
-			FROM V$ARCHIVED_LOG A
+			FROM V$ARCHIVED_LOG A, V$DATABASE D
 			WHERE A.NAME IS NOT NULL
 			AND A.ARCHIVED = 'YES'
 			AND A.STATUS = 'A'
 			AND A.NEXT_CHANGE# >= :1
 			AND A.FIRST_CHANGE# <= :2
+			AND A.RESETLOGS_CHANGE# = D.RESETLOGS_CHANGE#
+			AND A.RESETLOGS_TIME = D.RESETLOGS_TIME
 			AND A.DEST_ID IN (
 				SELECT DEST_ID
 				FROM V$ARCHIVE_DEST_STATUS
@@ -1068,7 +1139,15 @@ func (*LogFileCollector) GetLogsBySCNRange(ctx context.Context, conn *sql.Conn, 
 		)
 		ORDER BY SEQ`
 
-	rows, err := conn.QueryContext(ctx, query, startSCN, endSCN)
+	if c.stmt == nil {
+		stmt, err := conn.PrepareContext(ctx, query)
+		if err != nil {
+			return nil, fmt.Errorf("preparing logs by SCN range query: %w", err)
+		}
+		c.stmt = stmt
+	}
+
+	rows, err := c.stmt.QueryContext(ctx, startSCN, endSCN)
 	if err != nil {
 		return nil, fmt.Errorf("querying logs overlapping SCN range [%d, %d]: %w", startSCN, endSCN, err)
 	}
@@ -1091,6 +1170,16 @@ func (*LogFileCollector) GetLogsBySCNRange(ctx context.Context, conn *sql.Conn, 
 		return nil, err
 	}
 	return deduplicateLogs(archived, online), nil
+}
+
+// Close releases the prepared GetLogsBySCNRange statement, if any.
+func (c *LogFileCollector) Close() error {
+	if c.stmt == nil {
+		return nil
+	}
+	err := c.stmt.Close()
+	c.stmt = nil
+	return err
 }
 
 // deduplicateLogs merges archive and online log lists, preferring the archive
@@ -1189,6 +1278,7 @@ func toMessageEvent(dml *sqlredo.DMLEvent, scn uint64, checkpointSCN uint64, com
 		Timestamp:       dml.Timestamp,
 		TransactionID:   dml.TransactionID.String(),
 		CommitTimestamp: commitTimestamp,
+		Username:        dml.Username,
 	}
 
 	switch dml.Operation {

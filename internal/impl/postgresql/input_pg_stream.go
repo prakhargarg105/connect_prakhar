@@ -90,6 +90,10 @@ This input adds the following metadata fields to each message:
 - schema: The table schema in benthos common schema format, compatible with processors like parquet_encode
 - commit_ts_ms: The commit timestamp of the transaction as a Unix millisecond timestamp. Not set for snapshot reads.
 - before: The pre-change state of the row for update and delete operations, in benthos common schema format. For updates, availability depends on the table's REPLICA IDENTITY setting - with the default identity only key columns are present, with REPLICA IDENTITY FULL all columns are present.
+
+== Unserializable rows
+
+A row whose decoded WAL data cannot be marshalled to JSON (in practice non-finite floating point values such as NaN or Infinity) is published with its error set and a plain-text rendering of the row as the payload, rather than stalling the stream or silently dropping the row. Such messages can be inspected with the ` + "`errored()`" + ` Bloblang function and routed with error-handling components (for example a ` + "`switch`" + ` output with ` + "`reject_errored`" + `, or a dead-letter queue); if not handled they flow through the pipeline like any other message. The replication checkpoint advances past them normally once acknowledged.
 		`).
 		Field(service.NewStringField(fieldDSN).
 			Description("The Data Source Name for the PostgreSQL database in the form of `postgres://[user[:password]@][netloc][:port][/dbname][?param1=value1&...]`. Please note that Postgres enforces SSL by default, you can override this with the parameter `sslmode=disable` if required.").
@@ -175,7 +179,7 @@ This connector uses the naming pattern ` + "`pglog_stream_<replication_slot_name
 				ShortDescription("The AWS region where the PostgreSQL instance is located. Defaults to the environment region.").
 				Optional(),
 			service.NewStringField("endpoint").
-				Description("The PostgreSQL endpoint hostname (e.g., mydb.abc123.us-east-1.rds.amazonaws.com)."),
+				Description("The PostgreSQL endpoint hostname (for example, mydb.abc123.us-east-1.rds.amazonaws.com)."),
 			service.NewStringField("id").
 				Description("The ID of credentials to use.").
 				Optional().Advanced(),
@@ -212,15 +216,15 @@ This connector uses the naming pattern ` + "`pglog_stream_<replication_slot_name
 			Optional()).
 		Field(service.NewStringField(fieldSignalTableName).
 			Description(`The name of the table used to send control signals to the connector, excluding the schema. The table must
-exist in the schema configured via the ` + "`schema`" + ` field, and must not also appear in ` + "`" + fieldTables + "`" + `
-— the signal table is implicitly added to the publication and excluded from snapshot scans, so listing
-it in both places is rejected at startup. It must have at least these columns — startup validation checks
-column names only, not types, so a wrong column type (e.g. ` + "`data JSONB`" + ` instead of ` + "`TEXT`" + `)
+exist in the schema configured via the ` + "`schema`" + ` field, and must not also appear in ` + "`" + fieldTables + "`" + `,
+since the signal table is implicitly added to the publication and excluded from snapshot scans, so listing
+it in both places is rejected at startup. It must have at least these columns; startup validation checks
+column names only, not types, so a wrong column type (for example ` + "`data JSONB`" + ` instead of ` + "`TEXT`" + `)
 is only caught at runtime, on the first signal row read:
 
-- **id** — any type representable as a string (e.g. ` + "`SERIAL`" + `, ` + "`BIGSERIAL`" + `, ` + "`UUID`" + `, ` + "`VARCHAR`" + `)
-- **type** — should be ` + "`VARCHAR`" + ` or another string type — the signal type (see supported signals below)
-- **data** — should be ` + "`TEXT`" + ` — a JSON object containing signal parameters
+- **id**: any type representable as a string (for example ` + "`SERIAL`" + `, ` + "`BIGSERIAL`" + `, ` + "`UUID`" + `, ` + "`VARCHAR`" + `)
+- **type**: should be ` + "`VARCHAR`" + ` or another string type: the signal type (see supported signals below)
+- **data**: should be ` + "`TEXT`" + `: a JSON object containing signal parameters
 
 Create the table with:
 
@@ -245,7 +249,7 @@ pipeline:
 
 **Supported signals**
 
-**` + "`log`" + `** — recognized and logged when received. The ` + "`data`" + ` column must contain
+**` + "`log`" + `**: recognized and logged when received. The ` + "`data`" + ` column must contain
 a JSON object with a ` + "`message`" + ` key, whose value is written to the connector's log output.
 
 ` + "```sql" + `
@@ -483,7 +487,7 @@ type pgStreamInput struct {
 
 	snapshotMetrics *service.MetricGauge
 	replicationLag  *service.MetricGauge
-	controlSig      *postgresSignaller
+	controlSig      controlSignaller
 	stopSig         *shutdown.Signaller
 
 	// snapshotAckWG tracks in-flight snapshot batches: incremented when a
@@ -599,21 +603,36 @@ func (p *pgStreamInput) processStream(pgStream *pglogicalstream.Stream, batcher 
 			var (
 				flush bool
 				mb    []byte
-				err   error
 			)
 			for _, msg := range batch {
-				if p.controlSig.enabled() {
-					if _, err := p.controlSig.listen(&msg); err != nil {
-						// Log it and fall through to the normal emit path below.
-						p.logger.Errorf("failed to detect control signal in change event: %s", err)
-					}
+				// noop if not configured
+				if _, err := p.controlSig.listen(&msg); err != nil {
+					// Log it and fall through to the normal emit path below.
+					p.logger.Errorf("failed to detect control signal in change event: %s", err)
 				}
 
-				if mb, err = json.Marshal(msg.Data); err != nil {
-					p.logger.Errorf("failure to marshal message: %s", err)
-					break
+				var marshalErr error
+				if mb, marshalErr = json.Marshal(msg.Data); marshalErr != nil {
+					// A marshal failure is deterministic (in practice
+					// non-finite floats), so neither skipping the row (silent
+					// loss) nor restarting (the same row fails on every
+					// reconnect, and the stalled slot blocks WAL retention on
+					// the server) can make progress. Publish the row with its
+					// error set instead: the stream keeps moving,
+					// at-least-once holds (the row IS delivered, flagged),
+					// and operators can inspect or route it with
+					// error-handling components.
+					rowLSN := "unknown"
+					if msg.LSN != nil {
+						rowLSN = *msg.LSN
+					}
+					p.logger.Warnf("Publishing unmarshalable row from table %s (LSN %s) with its error set for error-routing: %v", msg.Table, rowLSN, marshalErr)
+					mb = fmt.Appendf(nil, "%+v", msg.Data)
 				}
 				batchMsg := service.NewMessage(mb)
+				if marshalErr != nil {
+					batchMsg.SetError(fmt.Errorf("marshalling WAL row from table %s: %w", msg.Table, marshalErr))
+				}
 				batchMsg.MetaSet("table", msg.Table)
 				batchMsg.MetaSet("operation", string(msg.Operation))
 				if msg.LSN != nil {

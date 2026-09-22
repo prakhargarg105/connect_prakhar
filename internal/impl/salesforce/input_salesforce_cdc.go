@@ -60,11 +60,11 @@ func salesforceCDCInputConfigSpec() *service.ConfigSpec {
 		Summary("Streams Salesforce Change Data Capture (CDC) and Platform Events from the Pub/Sub gRPC API, optionally preceded by a REST snapshot of the configured sObjects.").
 		Description(`Subscribes to one or more Salesforce Pub/Sub topics in parallel and emits a message per event. Topics may be:
 
-- ` + "`/data/<sObject>ChangeEvent`" + ` — per-sObject CDC channel.
-- ` + "`/data/ChangeEvents`" + ` — CDC firehose (every CDC-enabled sObject).
-- ` + "`/event/<EventName>__e`" + ` — custom Platform Event.
-- ` + "`/event/<StandardEventName>`" + ` — standard Platform Event (e.g. ` + "`LoginEventStream`" + `).
-- A bare sObject name (e.g. ` + "`Account`" + `) is shorthand for ` + "`/data/AccountChangeEvent`" + `.
+- ` + "`/data/<sObject>ChangeEvent`" + `: per-sObject CDC channel.
+- ` + "`/data/ChangeEvents`" + `: CDC firehose (every CDC-enabled sObject).
+- ` + "`/event/<EventName>__e`" + `: custom Platform Event.
+- ` + "`/event/<StandardEventName>`" + `: standard Platform Event (for example ` + "`LoginEventStream`" + `).
+- A bare sObject name (for example, ` + "`Account`" + `) is shorthand for ` + "`/data/AccountChangeEvent`" + `.
 
 Optionally runs a REST snapshot for the CDC sObjects before opening the streaming subscriptions, so the pipeline sees the current state plus continuous changes. Per-topic replay state persists in a cache resource so each subscription resumes across restarts independently.
 
@@ -78,20 +78,20 @@ Use ` + "`salesforce_cdc`" + ` for:
 
 Use a different Salesforce input instead if:
 
-- You only need a one-off extract or periodic SOQL query — use xref:components:inputs/salesforce.adoc[` + "`salesforce`" + `].
-- You need a GraphQL query (cross-object in one request) — use xref:components:inputs/salesforce_graphql.adoc[` + "`salesforce_graphql`" + `].
+- You only need a one-off extract or periodic SOQL query: use xref:components:inputs/salesforce.adoc[` + "`salesforce`" + `].
+- You need a GraphQL query (cross-object in one request): use xref:components:inputs/salesforce_graphql.adoc[` + "`salesforce_graphql`" + `].
 
 == Metadata
 
 Every emitted message has:
 
-- ` + "`topic`" + `: The full Pub/Sub topic path (e.g. "/event/Order__e").
+- ` + "`topic`" + `: The full Pub/Sub topic path (for example, "/event/Order__e").
 - ` + "`replay_id`" + `: The Pub/Sub replay ID in hex (streaming events only).
 
 CDC events also carry:
 
 - ` + "`operation`" + `: "read" for snapshot rows; "create", "update", "delete", or "undelete" for CDC events.
-- ` + "`sobject`" + `: The sObject API name (e.g. "Account").
+- ` + "`sobject`" + `: The sObject API name (for example, "Account").
 - ` + "`record_ids`" + `: Comma-separated record IDs affected by the event (when present).
 
 Platform Events also carry:
@@ -116,7 +116,7 @@ Each ` + "`/data/...`" + ` topic requires Change Data Capture to be enabled for 
 			Example([]string{"Account", "/event/Order__e"}).
 			Example([]string{"Opportunity", "MyCustom__c", "/event/Sync_Requested__e"})).
 		Field(service.NewBoolField(sfciFieldStreamSnapshot).
-			Description("When true (default), paginate a full REST snapshot of every CDC sObject in `topics` before opening any streaming subscription. When false, skip the snapshot and start streaming immediately. Platform Event topics (`/event/...`) are always skipped — they have no REST equivalent.").
+			Description("When true (default), paginate a full REST snapshot of every CDC sObject in `topics` before opening any streaming subscription. When false, skip the snapshot and start streaming immediately. Platform Event topics (`/event/...`) are always skipped; they have no REST equivalent.").
 			ShortDescription("Paginate a full REST snapshot of every CDC sObject in topics before opening a streaming subscription.").
 			Default(true)).
 		Field(service.NewStringEnumField(sfciFieldReplayPreset, sfciReplayLatest, sfciReplayEarliest).
@@ -124,7 +124,7 @@ Each ` + "`/data/...`" + ` topic requires Change Data Capture to be enabled for 
 			ShortDescription("Initial replay position per topic, used only on the first run when no checkpoint exists.").
 			Default(sfciReplayLatest)).
 		Field(service.NewIntField(sfciFieldSnapshotMaxBatchSize).
-			Description("Page size for the REST snapshot query — records per `/query` response. Must be between 200 and 2000 per Salesforce REST API limits. Larger pages reduce HTTP round trips; smaller pages reduce peak memory per fetch.").
+			Description("Page size for the REST snapshot query; records per `/query` response. Must be between 200 and 2000 per Salesforce REST API limits. Larger pages reduce HTTP round trips; smaller pages reduce peak memory per fetch.").
 			ShortDescription("Records per REST snapshot query response. Must be between 200 and 2000.").
 			Default(2000).
 			Example(2000).
@@ -136,7 +136,7 @@ Each ` + "`/data/...`" + ` topic requires Change Data Capture to be enabled for 
 			Example(100).
 			Example(500)).
 		Field(service.NewIntField(sfciFieldMaxParallelSnapshotObjs).
-			Description("Number of sObjects snapshotted concurrently during the REST snapshot phase. Each in-flight snapshot consumes one HTTP connection and Salesforce API call quota. Default 1 serializes the work — raise when snapshotting many sObjects and your API limits permit.").
+			Description("Number of sObjects snapshotted concurrently during the REST snapshot phase. Each in-flight snapshot consumes one HTTP connection and Salesforce API call quota. Default 1 serializes the work; raise when snapshotting many sObjects and your API limits permit.").
 			ShortDescription("Number of sObjects snapshotted concurrently during the REST snapshot phase.").
 			Default(1)).
 		Field(service.NewStringField(sfFieldCheckpointCache).
@@ -209,7 +209,7 @@ input:
 	)
 
 	spec = spec.Example("Platform Events only",
-		"Stream a custom event and a standard login stream — snapshot is skipped automatically:",
+		"Stream a custom event and a standard login stream: snapshot is skipped automatically:",
 		`
 input:
   salesforce_cdc:
@@ -727,6 +727,10 @@ func (e *salesforceCDCInputExecutor) emitSnapshot(
 		return fmt.Errorf("track snapshot checkpoint: %w", err)
 	}
 
+	// The ack error is deliberately ignored: nacks are replayed by
+	// auto_replay_nacks (the default), and disabling that is a documented
+	// opt-in to DROP rejected messages, so the checkpoint must advance past
+	// them rather than pin the tracker.
 	ackFn := func(ackCtx context.Context, _ error) error {
 		resolved := resolveFn()
 		if resolved == nil {
@@ -740,11 +744,11 @@ func (e *salesforceCDCInputExecutor) emitSnapshot(
 		e.stateMu.Lock()
 		e.state.SnapshotComplete = acked.SnapshotComplete
 		e.state.RestCursor = acked.RestCursor
-		err := e.saveStateLocked(ackCtx)
+		persistErr := e.saveStateLocked(ackCtx)
 		e.stateMu.Unlock()
 
-		if err != nil {
-			return fmt.Errorf("persist snapshot checkpoint: %w", err)
+		if persistErr != nil {
+			return fmt.Errorf("persist snapshot checkpoint: %w", persistErr)
 		}
 		return nil
 	}
@@ -900,6 +904,10 @@ func (e *salesforceCDCInputExecutor) flushTopic(
 		return fmt.Errorf("track checkpoint for %s: %w", topic, err)
 	}
 
+	// The ack error is deliberately ignored: nacks are replayed by
+	// auto_replay_nacks (the default), and disabling that is a documented
+	// opt-in to DROP rejected messages, so the checkpoint must advance past
+	// them rather than pin the tracker.
 	ackFn := func(ackCtx context.Context, _ error) error {
 		resolved := resolveFn()
 		if resolved == nil {
@@ -912,11 +920,11 @@ func (e *salesforceCDCInputExecutor) flushTopic(
 
 		e.stateMu.Lock()
 		e.state.Topics[topic] = acked
-		err := e.saveStateLocked(ackCtx)
+		persistErr := e.saveStateLocked(ackCtx)
 		e.stateMu.Unlock()
 
-		if err != nil {
-			return fmt.Errorf("persist checkpoint: %w", err)
+		if persistErr != nil {
+			return fmt.Errorf("persist checkpoint: %w", persistErr)
 		}
 		return nil
 	}
@@ -961,7 +969,17 @@ func setMetaIfNonEmpty(msg *service.Message, key, value string) {
 // handleStreamErr handles a per-topic permanent stream failure. A stale
 // replay_id (codes.InvalidArgument) is recoverable: clear it, persist, and
 // return true so the caller resubscribes via the configured preset.
+//
+// Terminal verdicts from the subscription (undecodable payload, unfetchable
+// schema) are never treated as a stale replay ID, even when they wrap a gRPC
+// InvalidArgument: that status describes the schema, and clearing the
+// checkpoint would resubscribe via the preset and silently skip everything
+// between the checkpoint and now.
 func (e *salesforceCDCInputExecutor) handleStreamErr(ctx context.Context, topic string, err error) bool {
+	var terminal *salesforcegrpc.TerminalStreamError
+	if errors.As(err, &terminal) {
+		return false
+	}
 	if grpcErr, ok := status.FromError(err); ok && grpcErr.Code() == codes.InvalidArgument {
 		e.logger.Warnf("topic %s replay_id rejected (%s); clearing and reconnecting via configured preset", topic, grpcErr.Message())
 

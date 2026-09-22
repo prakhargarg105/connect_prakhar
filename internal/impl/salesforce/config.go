@@ -78,11 +78,11 @@ func authFieldSpecs() []*service.ConfigField {
 			Description("Consumer Key of the Salesforce Connected App authorized for the OAuth Client Credentials flow. Create the Connected App under Setup → App Manager → New Connected App, enable OAuth settings, enable the Client Credentials Flow under `Flow Enablement`, then copy the Consumer Key from `Manage Consumer Details`.").
 			ShortDescription("Consumer Key of the Salesforce Connected App authorised for the OAuth Client Credentials flow."),
 		service.NewStringField(sfFieldClientSecret).
-			Description("Consumer Secret of the Salesforce Connected App, paired with `client_id`. Sensitive — prefer environment variable interpolation (`${SALESFORCE_CLIENT_SECRET}`) over inlining.").
+			Description("Consumer Secret of the Salesforce Connected App, paired with `client_id`. Sensitive; prefer environment variable interpolation (`${SALESFORCE_CLIENT_SECRET}`) over inlining.").
 			ShortDescription("Consumer Secret of the Salesforce Connected App, paired with client_id.").
 			Secret(),
 		service.NewStringField(sfFieldAPIVersion).
-			Description("Salesforce REST API version to target, prefixed with `v`. Affects endpoint paths (`/services/data/{api_version}/...`) and available fields/objects. Must be supported by your org — check Setup → Company Information. Older versions may lack recent fields.").
+			Description("Salesforce REST API version to target, prefixed with `v`. Affects endpoint paths (`/services/data/{api_version}/...`) and available fields/objects. Must be supported by your org; check Setup → Company Information. Older versions may lack recent fields.").
 			ShortDescription("Salesforce REST API version to target, prefixed with v.").
 			Default("v65.0").
 			Example("v65.0").
@@ -177,7 +177,8 @@ func grpcFieldSpec() *service.ConfigField {
 			Description("Maximum delay for gRPC reconnection backoff.").
 			Default("30s"),
 		service.NewIntField(sfFieldGRPCReconnectMaxAttempts).
-			Description("Maximum number of gRPC reconnection attempts. 0 means unlimited.").
+			Description("Maximum number of gRPC reconnection attempts. 0 means unlimited. This budget also governs transient schema-fetch failures: an event whose schema fetch keeps failing at the same replay position is retried (by reconnect-and-redeliver, or inline before the first event is delivered) this many times before the topic fails permanently. Deterministic schema failures - a schema that is missing, inaccessible, or fails to compile - and payloads that repeatedly fail to decode give up after a small fixed number of attempts regardless of this setting, since retrying cannot change the outcome.").
+			ShortDescription("Maximum gRPC reconnection attempts (0 = unlimited); also bounds transient schema-fetch retries before the topic fails permanently.").
 			Default(0),
 		service.NewDurationField(sfFieldGRPCShutdownTimeout).
 			Description("Timeout for graceful gRPC client shutdown.").
